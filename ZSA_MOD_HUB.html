@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZSA Mod Hub</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        // Import necessary Firestore and Auth methods
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, addDoc, onSnapshot, collection, query, orderBy, doc, getDoc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the environment - Ensure safe reading
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfigString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        let firebaseConfig = {};
+        try {
+            // Attempt to parse config, which might be an empty string if not provided
+            firebaseConfig = JSON.parse(firebaseConfigString || '{}');
+        } catch (e) {
+            console.error("Failed to parse Firebase Config:", e);
+        }
+
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let currentAuthorName = 'Anonymous Uploader'; // Default name used if none is set
+        let isFirebaseInitialized = false;
+
+        // --- CORE FIREBASE INITIALIZATION ---
+        // Only try to initialize if the parsed config object has keys (is valid)
+        if (Object.keys(firebaseConfig).length > 0) {
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                isFirebaseInitialized = true;
+            } catch (e) {
+                console.error("Firebase Initialization Error:", e);
+                // Keep isFirebaseInitialized as false if the setup fails
+            }
+        } else {
+             console.warn("Firebase configuration is missing or empty. Database features disabled.");
+        }
+
+
+        // --- Utility Functions ---
+
+        // Utility to manage custom alerts/modals
+        const showMessage = (text, type = 'success') => {
+            const modal = document.getElementById('messageModal');
+            const content = document.getElementById('messageContent');
+            
+            content.textContent = text;
+            
+            let bgColor = 'bg-green-500';
+            if (type === 'error') bgColor = 'bg-red-500';
+            if (type === 'info') bgColor = 'bg-blue-500';
+            
+            const modalContainer = modal.querySelector('.max-w-sm > div');
+            modalContainer.className = `p-4 rounded-lg shadow-xl max-w-sm w-full transition-all ${bgColor}`;
+            
+            modal.classList.remove('hidden');
+            setTimeout(() => {
+                modal.classList.add('hidden');
+            }, 3000);
+        };
+        
+        // Reference to the public mods list
+        const getModsCollectionRef = () => {
+            if (!isFirebaseInitialized) return null;
+            // Path: /artifacts/{appId}/public/data/mods
+            return collection(db, 'artifacts', appId, 'public', 'data', 'mods');
+        };
+
+        // Reference to the public usernames reservation collection
+        const getUsernamesCollectionRef = (name = null) => {
+            if (!isFirebaseInitialized) return null;
+            const namesCollection = collection(db, 'artifacts', appId, 'public', 'data', 'usernames');
+            if (name) {
+                // Returns a document reference using the name (lowercased) as the ID
+                return doc(namesCollection, name.toLowerCase());
+            }
+            // Returns the collection reference
+            return namesCollection;
+        };
+
+
+        // --- Account Simulation Functions (using Display Name) ---
+
+        // Function to load display name from localStorage
+        const loadDisplayName = () => {
+            const storedName = localStorage.getItem('zsaModDisplayName');
+            if (storedName) {
+                currentAuthorName = storedName;
+            }
+        };
+
+        // Function to update the User Auth Panel UI and upload form state
+        const updateAuthPanel = (user) => {
+            const panel = document.getElementById('authPanel');
+            const uploadForm = document.getElementById('modUploadForm');
+            const uploadButton = document.getElementById('uploadButton');
+
+            if (!panel || !uploadForm || !uploadButton) return;
+
+            let statusHTML = '';
+
+            if (!isFirebaseInitialized || !user) {
+                // Case 1: Firebase failed or Auth failed
+                const uploadMessage = isFirebaseInitialized ? 
+                    'Please set your display name below to create your unique uploader identity.' :
+                    'Database not configured. Upload is permanently disabled.';
+
+                statusHTML = `
+                    <div class="p-4 ${isFirebaseInitialized ? 'bg-yellow-900/50 border border-yellow-500' : 'bg-red-800/50 border border-red-500'} rounded-lg space-y-4">
+                        <p class="text-yellow-300 font-semibold text-lg border-b ${isFirebaseInitialized ? 'border-yellow-600' : 'border-red-600'} pb-2">Account Required for Upload</p>
+                        <p class="text-sm ${isFirebaseInitialized ? 'text-yellow-200' : 'text-red-300'}">${uploadMessage}</p>
+                        
+                        ${isFirebaseInitialized ? `
+                        <div class="flex space-x-2">
+                            <input type="text" id="displayNameInput" placeholder="Enter your display name" class="w-full bg-yellow-100 text-gray-900 border border-yellow-600 rounded-lg p-3 text-sm">
+                            <button onclick="setDisplayName()" class="flex-shrink-0 bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-3 px-4 rounded-lg text-sm transition duration-150" id="setNameButton">
+                                Set Name
+                            </button>
+                        </div>
+                        ` : ''}
+                    </div>
+                `;
+                uploadButton.disabled = true;
+                uploadButton.textContent = isFirebaseInitialized ? 'Set Name to Upload' : 'Upload Disabled';
+                uploadForm.classList.add('opacity-50', 'pointer-events-none');
+                panel.innerHTML = statusHTML;
+                return;
+            }
+            
+            // Case 2: Firebase and Auth are ready, checking for Display Name
+            const isAuthorizedForUpload = currentAuthorName !== 'Anonymous Uploader';
+
+            if (isAuthorizedForUpload) {
+                // User is "registered" with a display name and Firebase is ready
+                statusHTML = `
+                    <div class="flex flex-col space-y-3">
+                        <div class="flex items-center space-x-3 bg-green-900/40 p-3 rounded-lg border border-green-700">
+                            <svg class="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                            <div>
+                                <span class="text-sm text-gray-400">Signed in as:</span>
+                                <p class="text-lg font-bold text-green-300 truncate">${currentAuthorName}</p>
+                                <p class="text-xs text-gray-500 truncate">User ID: ${user.uid.substring(0, 12)}...</p>
+                            </div>
+                        </div>
+                        <button onclick="logoutUser()" class="w-full bg-red-600 hover:bg-red-700 text-sm text-white font-bold py-3 rounded-xl transition duration-150 shadow-md">
+                            Change Account Name
+                        </button>
+                    </div>
+                `;
+                uploadButton.disabled = false;
+                uploadButton.textContent = 'Submit Mod';
+                uploadForm.classList.remove('opacity-50', 'pointer-events-none');
+
+            } else {
+                 // Fallback to the display name input if Firebase is initialized but name is missing
+                statusHTML = `
+                    <div class="p-4 bg-yellow-900/50 border border-yellow-500 rounded-lg space-y-4">
+                        <p class="text-yellow-300 font-semibold text-lg border-b border-yellow-600 pb-2">Account Required for Upload</p>
+                        <p class="text-sm text-yellow-200">Please set your display name below to create your unique uploader identity.</p>
+                        <div class="flex space-x-2">
+                            <input type="text" id="displayNameInput" placeholder="Enter your display name" class="w-full bg-yellow-100 text-gray-900 border border-yellow-600 rounded-lg p-3 text-sm">
+                            <button onclick="setDisplayName()" class="flex-shrink-0 bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-3 px-4 rounded-lg text-sm transition duration-150" id="setNameButton">
+                                Set Name
+                            </button>
+                        </div>
+                    </div>
+                `;
+                uploadButton.disabled = true;
+                uploadButton.textContent = 'Set Name to Upload';
+                uploadForm.classList.add('opacity-50', 'pointer-events-none');
+            }
+            panel.innerHTML = statusHTML;
+        };
+
+        window.setDisplayName = async () => {
+            // Get the button reference using its ID
+            const setNameBtn = document.getElementById('setNameButton');
+            if (!setNameBtn) return; // Guard clause
+
+            const input = document.getElementById('displayNameInput');
+            const newName = input.value.trim();
+
+            if (newName.length < 3) {
+                showMessage("Display name must be at least 3 characters.", 'error');
+                return;
+            }
+            
+            // If Firebase is not initialized, we just set the local name but block uploads
+            if (!isFirebaseInitialized) {
+                 localStorage.setItem('zsaModDisplayName', newName);
+                 currentAuthorName = newName;
+                 updateAuthPanel(auth.currentUser); 
+                 showMessage(`Welcome, ${newName}! Name set locally, but database is not active.`, 'info');
+                 return;
+            }
+
+            if (!auth.currentUser) {
+                showMessage("Authentication not ready. Please wait for the system to sign you in.", 'error');
+                return;
+            }
+
+            // Disable button during check
+            setNameBtn.disabled = true;
+            setNameBtn.textContent = 'Checking...';
+
+            const normalizedName = newName.toLowerCase();
+
+            try {
+                // 1. Check for existing name in the dedicated 'usernames' collection
+                const nameDocRef = getUsernamesCollectionRef(normalizedName);
+                const nameDocSnap = await getDoc(nameDocRef);
+                
+                if (nameDocSnap.exists()) {
+                    showMessage(`Account name "${newName}" is already taken. Please choose another.`, 'error');
+                    return;
+                }
+
+                // 2. Claim the name by writing to the 'usernames' collection
+                await setDoc(nameDocRef, {
+                    originalName: newName,
+                    userId: auth.currentUser.uid,
+                    claimedAt: new Date().toISOString()
+                });
+
+                // 3. Success: save to localStorage and update UI
+                localStorage.setItem('zsaModDisplayName', newName);
+                currentAuthorName = newName;
+                updateAuthPanel(auth.currentUser);
+                showMessage(`Welcome, ${newName}! Your unique account name is set. You can now upload mods.`, 'success');
+
+            } catch (error) {
+                console.error("Error setting display name: ", error);
+                showMessage("Failed to set account name due to a system error.", 'error');
+            } finally {
+                setNameBtn.disabled = false;
+                setNameBtn.textContent = 'Set Name';
+            }
+        };
+        
+        window.logoutUser = async () => {
+            const user = auth.currentUser;
+            const oldName = currentAuthorName;
+
+            // Clear local storage and reset currentAuthorName
+            localStorage.removeItem('zsaModDisplayName');
+            currentAuthorName = 'Anonymous Uploader';
+
+            // Only attempt to clear the database entry if Firebase is initialized and we have a valid user/old name
+            if (isFirebaseInitialized && oldName !== 'Anonymous Uploader' && user) {
+                try {
+                    const nameDocRef = getUsernamesCollectionRef(oldName.toLowerCase());
+                    // Remove the username reservation to free it up for others
+                    await deleteDoc(nameDocRef); 
+                    showMessage(`Display name "${oldName}" cleared and made available for others.`, 'info');
+                } catch (error) {
+                    console.error("Error deleting display name:", error);
+                    showMessage("Name cleared locally, but failed to free up the name in the system.", 'error');
+                }
+            } else {
+                 showMessage("Display name cleared.", 'info');
+            }
+            
+            // Update UI
+            updateAuthPanel(user); 
+        };
+
+        const renderMods = (mods) => {
+            const container = document.getElementById('modListContainer');
+            container.innerHTML = ''; // Clear existing mods
+
+            if (mods.length === 0) {
+                container.innerHTML = `
+                    <div class="p-6 text-center text-gray-400">
+                        <svg class="w-10 h-10 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v13m-8-2h8m-4-4h4"></path></svg>
+                        <p class="text-lg font-semibold">No mods found.</p>
+                        <p class="text-sm">Be the first to upload a mod!</p>
+                    </div>
+                `;
+                return;
+            }
+
+            mods.forEach(mod => {
+                const modElement = document.createElement('div');
+                modElement.className = 'bg-gray-700 rounded-xl p-6 shadow-lg hover:shadow-2xl transition duration-300 transform hover:scale-[1.01] flex flex-col md:flex-row justify-between';
+                
+                modElement.innerHTML = `
+                    <div class="flex-grow">
+                        <h3 class="text-2xl font-bold text-green-400 mb-2">${mod.name} <span class="text-xs font-normal text-gray-400 ml-2">v${mod.version}</span></h3>
+                        <p class="text-gray-300 mb-3 text-sm italic">by <span class="text-green-300 font-semibold">${mod.author}</span></p>
+                        <p class="text-gray-200 text-base mb-4">${mod.description}</p>
+                    </div>
+                    <div class="md:w-48 flex-shrink-0 flex md:flex-col justify-end items-end space-x-4 md:space-x-0 md:space-y-3 mt-4 md:mt-0">
+                        <button onclick="downloadMod('${mod.name}', '${mod.downloadUrl}')" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition duration-150 shadow-md">
+                            Download (${mod.size || '3.5MB'})
+                        </button>
+                        <a href="javascript:void(0)" class="w-full text-center text-sm text-gray-400 hover:text-green-400 transition duration-150">
+                            Details
+                        </a>
+                    </div>
+                `;
+                container.appendChild(modElement);
+            });
+        };
+        
+        // Expose to global scope for button click handling
+        window.downloadMod = (modName, url) => {
+            if (!isFirebaseInitialized) {
+                 showMessage("Error: Firebase is not initialized. Cannot perform action.", 'error');
+                 return;
+            }
+            showMessage(`Starting download for: ${modName}. (URL: ${url})`, 'info');
+        };
+
+        const loadMods = () => {
+             if (!isFirebaseInitialized) {
+                document.getElementById('modListContainer').innerHTML = `
+                    <div class="p-6 text-center bg-red-800/50 border border-red-500 rounded-xl text-red-300">
+                        <p class="text-lg font-bold mb-2">Configuration Error</p>
+                        <p class="text-sm">Firebase is not configured. Mod list cannot be loaded or saved.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const modsRef = getModsCollectionRef();
+            const q = query(modsRef, orderBy('timestamp', 'desc')); 
+
+            onSnapshot(q, (querySnapshot) => {
+                const mods = [];
+                querySnapshot.forEach((doc) => {
+                    mods.push({ id: doc.id, ...doc.data() });
+                });
+                renderMods(mods);
+            }, (error) => {
+                console.error("Firestore listen error:", error); 
+                document.getElementById('modListContainer').innerHTML = `
+                    <div class="p-6 text-center bg-red-800/50 border border-red-500 rounded-xl text-red-300">
+                        <p class="text-lg font-bold mb-2">Error Loading Mods</p>
+                        <p class="text-sm">Could not fetch the mod list. Check console for details.</p>
+                    </div>
+                `;
+            });
+        };
+
+        const handleUpload = async (event) => {
+            event.preventDefault();
+            
+             if (!isFirebaseInitialized || !auth.currentUser) {
+                 showMessage("Error: Database not ready or user not signed in.", 'error');
+                 return;
+            }
+            
+            // Re-check: Must have a display name set
+            if (currentAuthorName === 'Anonymous Uploader') {
+                 showMessage("You must set your display name (Account) before uploading a mod.", 'error');
+                 return;
+            }
+
+            const form = event.target;
+            const name = form.modName.value.trim();
+            const version = form.modVersion.value.trim();
+            const description = form.modDescription.value.trim();
+            
+            if (!name || !version || !description) {
+                showMessage("Please fill out all required fields.", 'error');
+                return;
+            }
+
+            const uploadButton = document.getElementById('uploadButton');
+            uploadButton.disabled = true;
+            uploadButton.textContent = 'Uploading...';
+
+            try {
+                const newMod = {
+                    name,
+                    version,
+                    description,
+                    author: currentAuthorName, 
+                    downloadUrl: `mock_download_${Date.now()}.zip`, 
+                    size: `${(Math.random() * 10 + 2).toFixed(1)}MB`,
+                    timestamp: new Date().toISOString()
+                };
+
+                await addDoc(getModsCollectionRef(), newMod);
+                
+                showMessage("Mod uploaded successfully! It now appears in the list.", 'success');
+                form.reset(); // Clear the form
+
+            } catch (error) {
+                console.error("Error adding document: ", error);
+                showMessage("Upload failed: " + error.message, 'error');
+            } finally {
+                uploadButton.disabled = false;
+                uploadButton.textContent = 'Submit Mod';
+            }
+        };
+
+        // Attach event listener to the form after DOM is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            const form = document.getElementById('modUploadForm');
+            if (form) {
+                form.addEventListener('submit', handleUpload);
+            }
+        });
+
+        // --- Firebase Initialization and Auth Listener ---
+        const initAuthAndLoad = () => {
+             // 1. If Firebase failed to initialize, we still update the UI to show the error
+             if (!isFirebaseInitialized) {
+                updateAuthPanel(null);
+                loadMods(); 
+                return;
+             }
+             
+             // 2. Establish Firebase Auth
+             onAuthStateChanged(auth, async (user) => {
+                if (!user) {
+                    try {
+                        if (initialAuthToken) {
+                            const credential = await signInWithCustomToken(auth, initialAuthToken);
+                            user = credential.user;
+                            userId = user.uid;
+                        } else {
+                            const credential = await signInAnonymously(auth);
+                            user = credential.user;
+                            userId = user.uid;
+                        }
+                    } catch (error) {
+                        console.error("Auth error:", error);
+                        // If auth fails, user will be null, and upload will be restricted.
+                    }
+                } else {
+                    userId = user.uid;
+                }
+                
+                // 3. Load display name (our "account") and update UI state
+                loadDisplayName();
+                updateAuthPanel(user); 
+                
+                // 4. Load mods from Firestore 
+                loadMods(); 
+            });
+        };
+        
+        // Start the process
+        initAuthAndLoad();
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom scrollbar for dark theme */
+        .custom-scroll::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scroll::-webkit-scrollbar-thumb {
+            background-color: #4b5563; /* Gray-600 */
+            border-radius: 4px;
+        }
+        .custom-scroll::-webkit-scrollbar-track {
+            background: #1f2937; /* Gray-800 */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-6">
+
+    <!-- Modal for Custom Messages/Alerts -->
+    <div id="messageModal" class="hidden fixed top-0 left-0 w-full h-full flex items-start justify-center pt-10 z-50 pointer-events-none">
+        <div class="max-w-sm w-full transition-all">
+            <div class="p-4 rounded-lg shadow-xl bg-green-500">
+                <p id="messageContent" class="text-white font-semibold text-center"></p>
+            </div>
+        </div>
+    </div>
+
+    <div class="max-w-7xl mx-auto">
+        <!-- Header -->
+        <header class="text-center mb-12 py-8 bg-gray-800 rounded-2xl shadow-2xl">
+            <h1 class="text-5xl font-extrabold text-green-500 tracking-tight">
+                ZSA Modding Hub
+            </h1>
+            <p class="text-xl text-gray-400 mt-2">Upload, share, and download mods for Project ZSA.</p>
+        </header>
+
+        <!-- Main Content Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            
+            <!-- Mod Upload Column (Left/Top) -->
+            <div class="lg:col-span-1 space-y-8 h-fit sticky top-6">
+                
+                <!-- User Authentication Panel (Display Name) -->
+                <div id="authPanel" class="bg-gray-800 p-6 rounded-2xl shadow-xl">
+                    <div class="text-center text-gray-400">Loading user status...</div>
+                </div>
+
+                <div class="bg-gray-800 p-8 rounded-2xl shadow-xl">
+                    <h2 class="text-3xl font-bold mb-6 text-white border-b border-gray-700 pb-3">Submit a New Mod</h2>
+                    
+                    <form id="modUploadForm">
+                        <div class="mb-4">
+                            <label for="modName" class="block text-sm font-medium text-gray-300 mb-1">Mod Name</label>
+                            <input type="text" id="modName" name="modName" required class="w-full bg-gray-700 text-white border border-gray-600 rounded-lg p-3 focus:ring-green-500 focus:border-green-500">
+                        </div>
+
+                        <div class="mb-4">
+                            <label for="modVersion" class="block text-sm font-medium text-gray-300 mb-1">Version</label>
+                            <input type="text" id="modVersion" name="modVersion" value="1.0" required class="w-full bg-gray-700 text-white border border-gray-600 rounded-lg p-3 focus:ring-green-500 focus:border-green-500">
+                        </div>
+
+                        <div class="mb-6">
+                            <label for="modDescription" class="block text-sm font-medium text-gray-300 mb-1">Description</label>
+                            <textarea id="modDescription" name="modDescription" rows="4" required class="w-full bg-gray-700 text-white border border-gray-600 rounded-lg p-3 focus:ring-green-500 focus:border-green-500 resize-none"></textarea>
+                        </div>
+
+                        <!-- Placeholder for file input (Simulated) -->
+                        <div class="mb-6 border-2 border-dashed border-gray-600 p-4 rounded-lg text-center text-gray-400">
+                            <p class="text-sm font-medium">File Upload (Simulated)</p>
+                            <p class="text-xs mt-1">In a full application, the zip/file would be uploaded here.</p>
+                        </div>
+
+                        <button type="submit" id="uploadButton" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-xl transition duration-200 shadow-md">
+                            Set Name to Upload
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Mod List Column (Right) -->
+            <div class="lg:col-span-2">
+                <h2 class="text-3xl font-bold mb-6 text-white border-b border-gray-700 pb-3">Available Mods</h2>
+                
+                <div id="modListContainer" class="space-y-4">
+                    <!-- Mods will be rendered here by JavaScript -->
+                    <div class="p-6 text-center text-gray-400">
+                        <svg class="w-10 h-10 mx-auto animate-spin text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m1.593 6.5C7.575 16.5 9.778 17 12 17s4.425-.5 6.438-1.579M20 20v-5h-.582m-1.593-6.5C16.425 7.5 14.222 7 12 7s-4.425.5-6.438 1.579M20 12h-8m0 0v8"></path></svg>
+                        <p class="mt-3">Loading mods from Firestore...</p>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+    </div>
+
+</body>
+</html>
